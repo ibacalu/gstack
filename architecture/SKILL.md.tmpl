@@ -1,0 +1,280 @@
+---
+name: architecture
+version: 1.0.0
+description: |
+  Deep dive into the gstack codebase architecture. Explains the daemon model,
+  CLI→Server→Chromium pipeline, the ref system, logging, security model, SKILL.md
+  template system, and E2E test infrastructure. Use when asked "how does gstack work",
+  "explain the architecture", "where is X implemented", "how does the ref system work",
+  or any contributor/internals question.
+  Proactively suggest when someone is contributing to gstack, debugging the browse
+  binary, adding a new command, or trying to understand an architectural decision.
+allowed-tools:
+  - Bash
+  - Read
+  - Grep
+  - Glob
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+# gstack Architecture
+
+This skill answers internals questions about gstack. Everything below maps directly to
+`ARCHITECTURE.md` in the repo root — read that file for the full canonical reference.
+
+---
+
+## The 30-second picture
+
+```
+Claude Code                     gstack
+─────────                      ──────
+                               ┌──────────────────────┐
+  Tool call: $B snapshot -i    │  CLI (compiled binary)│
+  ─────────────────────────→   │  • reads state file   │
+                               │  • POST /command      │
+                               │    to localhost:PORT   │
+                               └──────────┬───────────┘
+                                          │ HTTP
+                               ┌──────────▼───────────┐
+                               │  Server (Bun.serve)   │
+                               │  • dispatches command  │
+                               │  • talks to Chromium   │
+                               │  • returns plain text  │
+                               └──────────┬───────────┘
+                                          │ CDP
+                               ┌──────────▼───────────┐
+                               │  Chromium (headless)   │
+                               │  • persistent tabs     │
+                               │  • cookies carry over  │
+                               │  • 30min idle timeout  │
+                               └───────────────────────┘
+```
+
+First call starts everything (~3s). Every subsequent call: ~100-200ms.
+
+---
+
+## System components
+
+### 1. CLI (`browse/src/cli.ts`)
+
+The compiled binary. On each invocation it:
+
+1. Reads `.gstack/browse.json` to find the running server (PID + port + token).
+2. Compares its own embedded version against the server's `binaryVersion`.
+   - If versions differ → kill old server, spawn fresh one (version auto-restart).
+   - If PID is dead or file missing → spawn new server.
+3. `POST /command` to `localhost:<port>` with `Authorization: Bearer <token>`.
+4. Prints the plain-text response to stdout.
+
+**Key files:**
+```
+browse/src/cli.ts          entry point, state-file logic
+browse/src/commands.ts     command registry (single source of truth)
+browse/dist/browse         compiled binary (run this, never node)
+browse/dist/.version       git SHA written at build time
+```
+
+### 2. Server (`browse/src/server.ts`)
+
+Long-lived `Bun.serve()` daemon. Responsibilities:
+
+- Manages a single `BrowserManager` (Playwright Chromium context).
+- Routes `/command` POST to `handleReadCommand`, `handleWriteCommand`, or `handleMetaCommand`.
+- Maintains ref map (`Map<string, RefEntry>`) in memory — cleared on navigation.
+- Runs three 50K-entry `CircularBuffer` ring buffers (console, network, dialog logs).
+- Flushes logs to `.gstack/*.log` every 1 second (async, never blocks HTTP).
+- Shuts down after 30 min idle.
+
+### 3. Chromium (via Playwright)
+
+Persistent headless Chromium process. Communicates with the server over CDP.  
+State (cookies, localStorage, open tabs) survives between CLI calls within a session.
+
+---
+
+## The daemon model
+
+gstack keeps Chromium alive between commands — no cold-start per call.
+
+**State file:** `.gstack/browse.json`
+```json
+{ "pid": 12345, "port": 34567, "token": "uuid-v4", "startedAt": "...", "binaryVersion": "abc123" }
+```
+Written atomically (tmp → rename, mode 0o600). CLI uses this to reach the running server.
+
+**Port selection:** Random 10000–60000 (retry up to 5 on collision) — supports multiple
+Conductor workspaces with zero configuration.
+
+---
+
+## The ref system
+
+Refs (`@e1`, `@e2`, `@c1`) let the agent address page elements without CSS selectors.
+
+```
+$B snapshot -i  →  server walks ARIA tree  →  assigns @e1, @e2, ...
+                    builds Playwright Locator for each ref
+                    stores Map<string, RefEntry> in memory
+
+$B click @e3    →  resolveRef("e3")
+                →  count() check (~5ms) — throws "Ref stale" if element gone
+                →  locator.click()
+```
+
+**Why Locators, not DOM injection:** CSP blocks script injection on many prod sites.
+React/Vue/Svelte reconciliation strips injected attributes. Shadow DOM is unreachable
+from outside. Playwright Locators (`getByRole()`) use the ARIA tree — external to the DOM.
+
+**Ref lifecycle:** Cleared on `framenavigated`. SPAs that mutate without navigation
+trigger the `count() === 0` stale check, which fails fast instead of timing out.
+
+**@c refs:** `-C` flag finds `cursor:pointer` / `onclick` elements not in the ARIA
+tree (custom `<div>` buttons). Separate `@c` namespace.
+
+---
+
+## Security model
+
+| Concern | Mitigation |
+|---------|------------|
+| Network exposure | Server binds `localhost` only — not reachable from network |
+| Process isolation | UUID bearer token in 0o600 state file — other processes can't call in |
+| Cookie handling | PBKDF2+AES decrypt in-process, never written to disk; values not in logs |
+| DB access | Cookie DB copied to temp, opened read-only — your browser's DB is never modified |
+| Shell injection | Browser paths hardcoded; Keychain via `Bun.spawn(argv[])`, not shell strings |
+
+---
+
+## SKILL.md template system
+
+Skills are **generated**, not hand-written:
+
+```
+SKILL.md.tmpl   (prose + {{PLACEHOLDERS}})
+      ↓  bun run gen:skill-docs
+SKILL.md        (committed, auto-generated sections filled in)
+```
+
+| Placeholder | Generated from |
+|-------------|----------------|
+| `{{COMMAND_REFERENCE}}` | `browse/src/commands.ts` |
+| `{{SNAPSHOT_FLAGS}}` | `browse/src/snapshot.ts` |
+| `{{PREAMBLE}}` | `scripts/gen-skill-docs.ts` — update check, session tracking, AskUserQuestion format |
+| `{{BASE_BRANCH_DETECT}}` | `gen-skill-docs.ts` — dynamic base branch for PR-targeting skills |
+| `{{QA_METHODOLOGY}}` | `gen-skill-docs.ts` — shared QA block |
+| `{{DESIGN_METHODOLOGY}}` | `gen-skill-docs.ts` — shared design audit block |
+
+**To add a command:** add to `commands.ts` → run `bun run gen:skill-docs` → commit `.tmpl` + `.md`.
+**To update skill prose:** edit the `.tmpl` → run `bun run gen:skill-docs` → commit both.
+**Never edit `.md` files directly** — they will be overwritten.
+
+---
+
+## Logging architecture
+
+```
+Browser events → CircularBuffer (50K entries, O(1) push) → async flush every 1s → .gstack/*.log
+```
+
+Three independent buffers: console, network, dialog. HTTP request handling is never
+blocked by disk I/O. The `console`, `network`, and `dialog` CLI commands read from
+the in-memory buffers, not disk. Disk files are for post-mortem debugging only.
+
+---
+
+## Command dispatch
+
+Commands are classified by side effects and dispatched accordingly:
+
+| Category | Examples | Handler |
+|----------|----------|---------|
+| READ | `text`, `html`, `links`, `console`, `cookies` | `handleReadCommand` |
+| WRITE | `goto`, `click`, `fill`, `press`, `upload` | `handleWriteCommand` |
+| META | `snapshot`, `screenshot`, `tabs`, `chain` | `handleMetaCommand` |
+
+---
+
+## E2E test infrastructure
+
+Tests spawn `claude -p` as a subprocess via `test/helpers/session-runner.ts`.
+
+```
+skill-e2e-*.test.ts  →  runSkillTest()  →  sh -c 'cat prompt | claude -p --output-format stream-json'
+                                         streams NDJSON
+                                         parses results, compares to expected behavior
+```
+
+**Test tiers:**
+
+| Tier | What | Cost | When |
+|------|------|------|------|
+| 1 | Parse `$B` commands, validate against registry | Free, <5s | `bun test` (every commit) |
+| 2 | E2E via `claude -p` | ~$3.85 | `bun run test:evals` (pre-ship) |
+| 3 | LLM-as-judge quality scoring | ~$0.15 | `bun run test:evals` (pre-ship) |
+
+**Diff-based selection:** Each E2E test declares file dependencies in
+`test/helpers/touchfiles.ts`. Only tests whose dependencies changed run by default —
+use `bun run test:evals:all` or `EVALS_ALL=1` to force everything.
+
+---
+
+## Key files at a glance
+
+```
+browse/src/
+  cli.ts          CLI entry point — state file, auto-restart, HTTP dispatch
+  server.ts       Bun.serve() daemon — command routing, BrowserManager, ring buffers
+  commands.ts     Command registry (source of truth for SKILL.md generation)
+  snapshot.ts     SNAPSHOT_FLAGS metadata (source of truth for -i/-D/-C flags docs)
+  browser.ts      BrowserManager — Playwright context, ref map, log buffers
+
+scripts/
+  gen-skill-docs.ts   Template → SKILL.md generator (run: bun run gen:skill-docs)
+  skill-check.ts      Health dashboard (run: bun run skill:check)
+  discover-skills.ts  Shared template discovery logic
+
+test/
+  helpers/
+    session-runner.ts  Spawns claude -p for E2E tests
+    eval-store.ts      Persists eval results to ~/.gstack-dev/evals/
+    touchfiles.ts      Declares file-to-test dependencies for diff-based selection
+  skill-e2e-*.test.ts  E2E tests per skill category
+  skill-validation.test.ts  Tier 1 static validation
+```
+
+---
+
+## Common contributor questions
+
+**Q: How do I add a new browse command?**
+1. Add entry to `browse/src/commands.ts` (category + description + args).
+2. Implement handler in `browse/src/server.ts` (appropriate `handle*Command` function).
+3. Run `bun run gen:skill-docs` — the command now appears in all SKILL.md files.
+4. Run `bun test` to validate. Run `bun run build` to recompile the binary.
+
+**Q: How do I update skill prose without touching code?**
+Edit `<skill-dir>/SKILL.md.tmpl` → `bun run gen:skill-docs` → commit both files.
+
+**Q: Why does the server use HTTP and not WebSockets or MCP?**
+HTTP request/response is simpler, debuggable with `curl`, and fast enough. MCP adds
+JSON schema overhead per request and requires a persistent connection. The bottleneck
+is always Chromium, not transport.
+
+**Q: Where are cookies stored?**
+Never on disk (after decryption). Decrypted values live in the Playwright browser
+context in-process. The raw encrypted cookies come from Chromium's SQLite DB
+(copied to temp, opened read-only). Decryption uses PBKDF2 + AES-128-CBC from the
+macOS Keychain password.
+
+**Q: How does version auto-restart work?**
+`bun run build` writes `git rev-parse HEAD` to `browse/dist/.version`. The compiled
+binary embeds this SHA. On each CLI call, if the running server's `binaryVersion`
+doesn't match, the CLI kills it and spawns a new one. Stale servers are impossible.
+
+**Q: Can I run multiple gstack sessions simultaneously?**
+Yes. Each workspace gets its own `.gstack/browse.json` with a random port. Ten
+Conductor workspaces → ten independent browse daemons, no port conflicts.

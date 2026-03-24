@@ -1,26 +1,23 @@
 ---
-name: gstack
-version: 1.1.0
+name: architecture
+version: 1.0.0
 description: |
-  MANUAL TRIGGER ONLY: invoke only when user types /gstack.
-  Fast headless browser for QA testing and site dogfooding. Navigate pages, interact with
-  elements, verify state, diff before/after, take annotated screenshots, test responsive
-  layouts, forms, uploads, dialogs, and capture bug evidence. Use when asked to open or
-  test a site, verify a deployment, dogfood a user flow, or file a bug with screenshots.
-  Also suggest adjacent gstack skills by stage: brainstorm /office-hours; strategy
-  /plan-ceo-review; architecture /plan-eng-review; design /plan-design-review or
-  /design-consultation; auto-review /autoplan; debugging /investigate; QA /qa; code review
-  /review; visual audit /design-review; shipping /ship; docs /document-release; retro
-  /retro; second opinion /codex; prod safety /careful or /guard; scoped edits /freeze or
-  /unfreeze; gstack internals /architecture; gstack upgrades /gstack-upgrade. If the user opts out of suggestions, stop
-  and run gstack-config set proactive false; if they opt back in, run gstack-config set
-  proactive true.
+  MANUAL TRIGGER ONLY: invoke only when user types /architecture.
+  Deep dive into the gstack codebase architecture. Explains the daemon model,
+  CLI→Server→Chromium pipeline, the ref system, logging, security model, SKILL.md
+  template system, and E2E test infrastructure. Use when asked "how does gstack work",
+  "explain the architecture", "where is X implemented", "how does the ref system work",
+  or any contributor/internals question.
+  Proactively suggest when someone is contributing to gstack, debugging the browse
+  binary, adding a new command, or trying to understand an architectural decision.
 allowed-tools:
   - Bash
   - Read
+  - Grep
+  - Glob
   - AskUserQuestion
-
 ---
+
 <!-- AUTO-GENERATED from SKILL.md.tmpl — do not edit directly -->
 <!-- Regenerate: bun run gen:skill-docs -->
 
@@ -50,7 +47,7 @@ _SESSION_ID="$$-$(date +%s)"
 echo "TELEMETRY: ${_TEL:-off}"
 echo "TEL_PROMPTED: $_TEL_PROMPTED"
 mkdir -p ~/.gstack/analytics
-echo '{"skill":"gstack","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","repo":"'$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || echo "unknown")'"}'  >> ~/.gstack/analytics/skill-usage.jsonl 2>/dev/null || true
+echo '{"skill":"architecture","ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","repo":"'$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || echo "unknown")'"}'  >> ~/.gstack/analytics/skill-usage.jsonl 2>/dev/null || true
 # zsh-compatible: use find instead of glob to avoid NOMATCH error
 for _PF in $(find ~/.gstack/analytics -maxdepth 1 -name '.pending-*' 2>/dev/null); do [ -f "$_PF" ] && ~/.claude/skills/gstack/bin/gstack-telemetry-log --event-type skill_run --skill _pending_finalize --outcome unknown --session-id "$_SESSION_ID" 2>/dev/null || true; break; done
 ```
@@ -300,370 +297,263 @@ Then write a `## GSTACK REVIEW REPORT` section to the end of the plan file:
 file you are allowed to edit in plan mode. The plan file review report is part of the
 plan's living status.
 
-If `PROACTIVE` is `false`: do NOT proactively suggest other gstack skills during this session.
-Only run skills the user explicitly invokes. This preference persists across sessions via
-`gstack-config`.
 
-# gstack browse: QA Testing & Dogfooding
+# gstack Architecture
 
-Persistent headless Chromium. First call auto-starts (~3s), then ~100-200ms per command.
-Auto-shuts down after 30 min idle. State persists between calls (cookies, tabs, sessions).
+This skill answers internals questions about gstack. Everything below maps directly to
+`ARCHITECTURE.md` in the repo root — read that file for the full canonical reference.
 
-## SETUP (run this check BEFORE any browse command)
+---
 
-```bash
-_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
-B=""
-[ -n "$_ROOT" ] && [ -x "$_ROOT/.claude/skills/gstack/browse/dist/browse" ] && B="$_ROOT/.claude/skills/gstack/browse/dist/browse"
-[ -z "$B" ] && B=~/.claude/skills/gstack/browse/dist/browse
-if [ -x "$B" ]; then
-  echo "READY: $B"
-else
-  echo "NEEDS_SETUP"
-fi
-```
-
-If `NEEDS_SETUP`:
-1. Tell the user: "gstack browse needs a one-time build (~10 seconds). OK to proceed?" Then STOP and wait.
-2. Run: `cd <SKILL_DIR> && ./setup`
-3. If `bun` is not installed: `curl -fsSL https://bun.sh/install | bash`
-
-## IMPORTANT
-
-- Use the compiled binary via Bash: `$B <command>`
-- NEVER use `mcp__claude-in-chrome__*` tools. They are slow and unreliable.
-- Browser persists between calls — cookies, login sessions, and tabs carry over.
-- Dialogs (alert/confirm/prompt) are auto-accepted by default — no browser lockup.
-- **Show screenshots:** After `$B screenshot`, `$B snapshot -a -o`, or `$B responsive`, always use the Read tool on the output PNG(s) so the user can see them. Without this, screenshots are invisible.
-
-## QA Workflows
-
-### Test a user flow (login, signup, checkout, etc.)
-
-```bash
-# 1. Go to the page
-$B goto https://app.example.com/login
-
-# 2. See what's interactive
-$B snapshot -i
-
-# 3. Fill the form using refs
-$B fill @e3 "test@example.com"
-$B fill @e4 "password123"
-$B click @e5
-
-# 4. Verify it worked
-$B snapshot -D              # diff shows what changed after clicking
-$B is visible ".dashboard"  # assert the dashboard appeared
-$B screenshot /tmp/after-login.png
-```
-
-### Verify a deployment / check prod
-
-```bash
-$B goto https://yourapp.com
-$B text                          # read the page — does it load?
-$B console                       # any JS errors?
-$B network                       # any failed requests?
-$B js "document.title"           # correct title?
-$B is visible ".hero-section"    # key elements present?
-$B screenshot /tmp/prod-check.png
-```
-
-### Dogfood a feature end-to-end
-
-```bash
-# Navigate to the feature
-$B goto https://app.example.com/new-feature
-
-# Take annotated screenshot — shows every interactive element with labels
-$B snapshot -i -a -o /tmp/feature-annotated.png
-
-# Find ALL clickable things (including divs with cursor:pointer)
-$B snapshot -C
-
-# Walk through the flow
-$B snapshot -i          # baseline
-$B click @e3            # interact
-$B snapshot -D          # what changed? (unified diff)
-
-# Check element states
-$B is visible ".success-toast"
-$B is enabled "#next-step-btn"
-$B is checked "#agree-checkbox"
-
-# Check console for errors after interactions
-$B console
-```
-
-### Test responsive layouts
-
-```bash
-# Quick: 3 screenshots at mobile/tablet/desktop
-$B goto https://yourapp.com
-$B responsive /tmp/layout
-
-# Manual: specific viewport
-$B viewport 375x812     # iPhone
-$B screenshot /tmp/mobile.png
-$B viewport 1440x900    # Desktop
-$B screenshot /tmp/desktop.png
-
-# Element screenshot (crop to specific element)
-$B screenshot "#hero-banner" /tmp/hero.png
-$B snapshot -i
-$B screenshot @e3 /tmp/button.png
-
-# Region crop
-$B screenshot --clip 0,0,800,600 /tmp/above-fold.png
-
-# Viewport only (no scroll)
-$B screenshot --viewport /tmp/viewport.png
-```
-
-### Test file upload
-
-```bash
-$B goto https://app.example.com/upload
-$B snapshot -i
-$B upload @e3 /path/to/test-file.pdf
-$B is visible ".upload-success"
-$B screenshot /tmp/upload-result.png
-```
-
-### Test forms with validation
-
-```bash
-$B goto https://app.example.com/form
-$B snapshot -i
-
-# Submit empty — check validation errors appear
-$B click @e10                        # submit button
-$B snapshot -D                       # diff shows error messages appeared
-$B is visible ".error-message"
-
-# Fill and resubmit
-$B fill @e3 "valid input"
-$B click @e10
-$B snapshot -D                       # diff shows errors gone, success state
-```
-
-### Test dialogs (delete confirmations, prompts)
-
-```bash
-# Set up dialog handling BEFORE triggering
-$B dialog-accept              # will auto-accept next alert/confirm
-$B click "#delete-button"     # triggers confirmation dialog
-$B dialog                     # see what dialog appeared
-$B snapshot -D                # verify the item was deleted
-
-# For prompts that need input
-$B dialog-accept "my answer"  # accept with text
-$B click "#rename-button"     # triggers prompt
-```
-
-### Test authenticated pages (import real browser cookies)
-
-```bash
-# Import cookies from your real browser (opens interactive picker)
-$B cookie-import-browser
-
-# Or import a specific domain directly
-$B cookie-import-browser comet --domain .github.com
-
-# Now test authenticated pages
-$B goto https://github.com/settings/profile
-$B snapshot -i
-$B screenshot /tmp/github-profile.png
-```
-
-### Compare two pages / environments
-
-```bash
-$B diff https://staging.app.com https://prod.app.com
-```
-
-### Multi-step chain (efficient for long flows)
-
-```bash
-echo '[
-  ["goto","https://app.example.com"],
-  ["snapshot","-i"],
-  ["fill","@e3","test@test.com"],
-  ["fill","@e4","password"],
-  ["click","@e5"],
-  ["snapshot","-D"],
-  ["screenshot","/tmp/result.png"]
-]' | $B chain
-```
-
-## Quick Assertion Patterns
-
-```bash
-# Element exists and is visible
-$B is visible ".modal"
-
-# Button is enabled/disabled
-$B is enabled "#submit-btn"
-$B is disabled "#submit-btn"
-
-# Checkbox state
-$B is checked "#agree"
-
-# Input is editable
-$B is editable "#name-field"
-
-# Element has focus
-$B is focused "#search-input"
-
-# Page contains text
-$B js "document.body.textContent.includes('Success')"
-
-# Element count
-$B js "document.querySelectorAll('.list-item').length"
-
-# Specific attribute value
-$B attrs "#logo"    # returns all attributes as JSON
-
-# CSS property
-$B css ".button" "background-color"
-```
-
-## Snapshot System
-
-The snapshot is your primary tool for understanding and interacting with pages.
+## The 30-second picture
 
 ```
--i        --interactive           Interactive elements only (buttons, links, inputs) with @e refs
--c        --compact               Compact (no empty structural nodes)
--d <N>    --depth                 Limit tree depth (0 = root only, default: unlimited)
--s <sel>  --selector              Scope to CSS selector
--D        --diff                  Unified diff against previous snapshot (first call stores baseline)
--a        --annotate              Annotated screenshot with red overlay boxes and ref labels
--o <path> --output                Output path for annotated screenshot (default: <temp>/browse-annotated.png)
--C        --cursor-interactive    Cursor-interactive elements (@c refs — divs with pointer, onclick)
+Claude Code                     gstack
+─────────                      ──────
+                               ┌──────────────────────┐
+  Tool call: $B snapshot -i    │  CLI (compiled binary)│
+  ─────────────────────────→   │  • reads state file   │
+                               │  • POST /command      │
+                               │    to localhost:PORT   │
+                               └──────────┬───────────┘
+                                          │ HTTP
+                               ┌──────────▼───────────┐
+                               │  Server (Bun.serve)   │
+                               │  • dispatches command  │
+                               │  • talks to Chromium   │
+                               │  • returns plain text  │
+                               └──────────┬───────────┘
+                                          │ CDP
+                               ┌──────────▼───────────┐
+                               │  Chromium (headless)   │
+                               │  • persistent tabs     │
+                               │  • cookies carry over  │
+                               │  • 30min idle timeout  │
+                               └───────────────────────┘
 ```
 
-All flags can be combined freely. `-o` only applies when `-a` is also used.
-Example: `$B snapshot -i -a -C -o /tmp/annotated.png`
+First call starts everything (~3s). Every subsequent call: ~100-200ms.
 
-**Ref numbering:** @e refs are assigned sequentially (@e1, @e2, ...) in tree order.
-@c refs from `-C` are numbered separately (@c1, @c2, ...).
+---
 
-After snapshot, use @refs as selectors in any command:
-```bash
-$B click @e3       $B fill @e4 "value"     $B hover @e1
-$B html @e2        $B css @e5 "color"      $B attrs @e6
-$B click @c1       # cursor-interactive ref (from -C)
+## System components
+
+### 1. CLI (`browse/src/cli.ts`)
+
+The compiled binary. On each invocation it:
+
+1. Reads `.gstack/browse.json` to find the running server (PID + port + token).
+2. Compares its own embedded version against the server's `binaryVersion`.
+   - If versions differ → kill old server, spawn fresh one (version auto-restart).
+   - If PID is dead or file missing → spawn new server.
+3. `POST /command` to `localhost:<port>` with `Authorization: Bearer <token>`.
+4. Prints the plain-text response to stdout.
+
+**Key files:**
+```
+browse/src/cli.ts          entry point, state-file logic
+browse/src/commands.ts     command registry (single source of truth)
+browse/dist/browse         compiled binary (run this, never node)
+browse/dist/.version       git SHA written at build time
 ```
 
-**Output format:** indented accessibility tree with @ref IDs, one element per line.
+### 2. Server (`browse/src/server.ts`)
+
+Long-lived `Bun.serve()` daemon. Responsibilities:
+
+- Manages a single `BrowserManager` (Playwright Chromium context).
+- Routes `/command` POST to `handleReadCommand`, `handleWriteCommand`, or `handleMetaCommand`.
+- Maintains ref map (`Map<string, RefEntry>`) in memory — cleared on navigation.
+- Runs three 50K-entry `CircularBuffer` ring buffers (console, network, dialog logs).
+- Flushes logs to `.gstack/*.log` every 1 second (async, never blocks HTTP).
+- Shuts down after 30 min idle.
+
+### 3. Chromium (via Playwright)
+
+Persistent headless Chromium process. Communicates with the server over CDP.  
+State (cookies, localStorage, open tabs) survives between CLI calls within a session.
+
+---
+
+## The daemon model
+
+gstack keeps Chromium alive between commands — no cold-start per call.
+
+**State file:** `.gstack/browse.json`
+```json
+{ "pid": 12345, "port": 34567, "token": "uuid-v4", "startedAt": "...", "binaryVersion": "abc123" }
 ```
-  @e1 [heading] "Welcome" [level=1]
-  @e2 [textbox] "Email"
-  @e3 [button] "Submit"
+Written atomically (tmp → rename, mode 0o600). CLI uses this to reach the running server.
+
+**Port selection:** Random 10000–60000 (retry up to 5 on collision) — supports multiple
+Conductor workspaces with zero configuration.
+
+---
+
+## The ref system
+
+Refs (`@e1`, `@e2`, `@c1`) let the agent address page elements without CSS selectors.
+
+```
+$B snapshot -i  →  server walks ARIA tree  →  assigns @e1, @e2, ...
+                    builds Playwright Locator for each ref
+                    stores Map<string, RefEntry> in memory
+
+$B click @e3    →  resolveRef("e3")
+                →  count() check (~5ms) — throws "Ref stale" if element gone
+                →  locator.click()
 ```
 
-Refs are invalidated on navigation — run `snapshot` again after `goto`.
+**Why Locators, not DOM injection:** CSP blocks script injection on many prod sites.
+React/Vue/Svelte reconciliation strips injected attributes. Shadow DOM is unreachable
+from outside. Playwright Locators (`getByRole()`) use the ARIA tree — external to the DOM.
 
-## Command Reference
+**Ref lifecycle:** Cleared on `framenavigated`. SPAs that mutate without navigation
+trigger the `count() === 0` stale check, which fails fast instead of timing out.
 
-### Navigation
-| Command | Description |
-|---------|-------------|
-| `back` | History back |
-| `forward` | History forward |
-| `goto <url>` | Navigate to URL |
-| `reload` | Reload page |
-| `url` | Print current URL |
+**@c refs:** `-C` flag finds `cursor:pointer` / `onclick` elements not in the ARIA
+tree (custom `<div>` buttons). Separate `@c` namespace.
 
-### Reading
-| Command | Description |
-|---------|-------------|
-| `accessibility` | Full ARIA tree |
-| `forms` | Form fields as JSON |
-| `html [selector]` | innerHTML of selector (throws if not found), or full page HTML if no selector given |
-| `links` | All links as "text → href" |
-| `text` | Cleaned page text |
+---
 
-### Interaction
-| Command | Description |
-|---------|-------------|
-| `click <sel>` | Click element |
-| `cookie <name>=<value>` | Set cookie on current page domain |
-| `cookie-import <json>` | Import cookies from JSON file |
-| `cookie-import-browser [browser] [--domain d]` | Import cookies from installed Chromium browsers (opens picker, or use --domain for direct import) |
-| `dialog-accept [text]` | Auto-accept next alert/confirm/prompt. Optional text is sent as the prompt response |
-| `dialog-dismiss` | Auto-dismiss next dialog |
-| `fill <sel> <val>` | Fill input |
-| `header <name>:<value>` | Set custom request header (colon-separated, sensitive values auto-redacted) |
-| `hover <sel>` | Hover element |
-| `press <key>` | Press key — Enter, Tab, Escape, ArrowUp/Down/Left/Right, Backspace, Delete, Home, End, PageUp, PageDown, or modifiers like Shift+Enter |
-| `scroll [sel]` | Scroll element into view, or scroll to page bottom if no selector |
-| `select <sel> <val>` | Select dropdown option by value, label, or visible text |
-| `type <text>` | Type into focused element |
-| `upload <sel> <file> [file2...]` | Upload file(s) |
-| `useragent <string>` | Set user agent |
-| `viewport <WxH>` | Set viewport size |
-| `wait <sel|--networkidle|--load>` | Wait for element, network idle, or page load (timeout: 15s) |
+## Security model
 
-### Inspection
-| Command | Description |
-|---------|-------------|
-| `attrs <sel|@ref>` | Element attributes as JSON |
-| `console [--clear|--errors]` | Console messages (--errors filters to error/warning) |
-| `cookies` | All cookies as JSON |
-| `css <sel> <prop>` | Computed CSS value |
-| `dialog [--clear]` | Dialog messages |
-| `eval <file>` | Run JavaScript from file and return result as string (path must be under /tmp or cwd) |
-| `is <prop> <sel>` | State check (visible/hidden/enabled/disabled/checked/editable/focused) |
-| `js <expr>` | Run JavaScript expression and return result as string |
-| `network [--clear]` | Network requests |
-| `perf` | Page load timings |
-| `storage [set k v]` | Read all localStorage + sessionStorage as JSON, or set <key> <value> to write localStorage |
+| Concern | Mitigation |
+|---------|------------|
+| Network exposure | Server binds `localhost` only — not reachable from network |
+| Process isolation | UUID bearer token in 0o600 state file — other processes can't call in |
+| Cookie handling | PBKDF2+AES decrypt in-process, never written to disk; values not in logs |
+| DB access | Cookie DB copied to temp, opened read-only — your browser's DB is never modified |
+| Shell injection | Browser paths hardcoded; Keychain via `Bun.spawn(argv[])`, not shell strings |
 
-### Visual
-| Command | Description |
-|---------|-------------|
-| `diff <url1> <url2>` | Text diff between pages |
-| `pdf [path]` | Save as PDF |
-| `responsive [prefix]` | Screenshots at mobile (375x812), tablet (768x1024), desktop (1280x720). Saves as {prefix}-mobile.png etc. |
-| `screenshot [--viewport] [--clip x,y,w,h] [selector|@ref] [path]` | Save screenshot (supports element crop via CSS/@ref, --clip region, --viewport) |
+---
 
-### Snapshot
-| Command | Description |
-|---------|-------------|
-| `snapshot [flags]` | Accessibility tree with @e refs for element selection. Flags: -i interactive only, -c compact, -d N depth limit, -s sel scope, -D diff vs previous, -a annotated screenshot, -o path output, -C cursor-interactive @c refs |
+## SKILL.md template system
 
-### Meta
-| Command | Description |
-|---------|-------------|
-| `chain` | Run commands from JSON stdin. Format: [["cmd","arg1",...],...] |
+Skills are **generated**, not hand-written:
 
-### Tabs
-| Command | Description |
-|---------|-------------|
-| `closetab [id]` | Close tab |
-| `newtab [url]` | Open new tab |
-| `tab <id>` | Switch to tab |
-| `tabs` | List open tabs |
+```
+SKILL.md.tmpl   (prose + {{PLACEHOLDERS}})
+      ↓  bun run gen:skill-docs
+SKILL.md        (committed, auto-generated sections filled in)
+```
 
-### Server
-| Command | Description |
-|---------|-------------|
-| `handoff [message]` | Open visible Chrome at current page for user takeover |
-| `restart` | Restart server |
-| `resume` | Re-snapshot after user takeover, return control to AI |
-| `status` | Health check |
-| `stop` | Shutdown server |
+| Placeholder | Generated from |
+|-------------|----------------|
+| `{{COMMAND_REFERENCE}}` | `browse/src/commands.ts` |
+| `{{SNAPSHOT_FLAGS}}` | `browse/src/snapshot.ts` |
+| `{{PREAMBLE}}` | `scripts/gen-skill-docs.ts` — update check, session tracking, AskUserQuestion format |
+| `{{BASE_BRANCH_DETECT}}` | `gen-skill-docs.ts` — dynamic base branch for PR-targeting skills |
+| `{{QA_METHODOLOGY}}` | `gen-skill-docs.ts` — shared QA block |
+| `{{DESIGN_METHODOLOGY}}` | `gen-skill-docs.ts` — shared design audit block |
 
-## Tips
+**To add a command:** add to `commands.ts` → run `bun run gen:skill-docs` → commit `.tmpl` + `.md`.
+**To update skill prose:** edit the `.tmpl` → run `bun run gen:skill-docs` → commit both.
+**Never edit `.md` files directly** — they will be overwritten.
 
-1. **Navigate once, query many times.** `goto` loads the page; then `text`, `js`, `screenshot` all hit the loaded page instantly.
-2. **Use `snapshot -i` first.** See all interactive elements, then click/fill by ref. No CSS selector guessing.
-3. **Use `snapshot -D` to verify.** Baseline → action → diff. See exactly what changed.
-4. **Use `is` for assertions.** `is visible .modal` is faster and more reliable than parsing page text.
-5. **Use `snapshot -a` for evidence.** Annotated screenshots are great for bug reports.
-6. **Use `snapshot -C` for tricky UIs.** Finds clickable divs that the accessibility tree misses.
-7. **Check `console` after actions.** Catch JS errors that don't surface visually.
-8. **Use `chain` for long flows.** Single command, no per-step CLI overhead.
+---
+
+## Logging architecture
+
+```
+Browser events → CircularBuffer (50K entries, O(1) push) → async flush every 1s → .gstack/*.log
+```
+
+Three independent buffers: console, network, dialog. HTTP request handling is never
+blocked by disk I/O. The `console`, `network`, and `dialog` CLI commands read from
+the in-memory buffers, not disk. Disk files are for post-mortem debugging only.
+
+---
+
+## Command dispatch
+
+Commands are classified by side effects and dispatched accordingly:
+
+| Category | Examples | Handler |
+|----------|----------|---------|
+| READ | `text`, `html`, `links`, `console`, `cookies` | `handleReadCommand` |
+| WRITE | `goto`, `click`, `fill`, `press`, `upload` | `handleWriteCommand` |
+| META | `snapshot`, `screenshot`, `tabs`, `chain` | `handleMetaCommand` |
+
+---
+
+## E2E test infrastructure
+
+Tests spawn `claude -p` as a subprocess via `test/helpers/session-runner.ts`.
+
+```
+skill-e2e-*.test.ts  →  runSkillTest()  →  sh -c 'cat prompt | claude -p --output-format stream-json'
+                                         streams NDJSON
+                                         parses results, compares to expected behavior
+```
+
+**Test tiers:**
+
+| Tier | What | Cost | When |
+|------|------|------|------|
+| 1 | Parse `$B` commands, validate against registry | Free, <5s | `bun test` (every commit) |
+| 2 | E2E via `claude -p` | ~$3.85 | `bun run test:evals` (pre-ship) |
+| 3 | LLM-as-judge quality scoring | ~$0.15 | `bun run test:evals` (pre-ship) |
+
+**Diff-based selection:** Each E2E test declares file dependencies in
+`test/helpers/touchfiles.ts`. Only tests whose dependencies changed run by default —
+use `bun run test:evals:all` or `EVALS_ALL=1` to force everything.
+
+---
+
+## Key files at a glance
+
+```
+browse/src/
+  cli.ts          CLI entry point — state file, auto-restart, HTTP dispatch
+  server.ts       Bun.serve() daemon — command routing, BrowserManager, ring buffers
+  commands.ts     Command registry (source of truth for SKILL.md generation)
+  snapshot.ts     SNAPSHOT_FLAGS metadata (source of truth for -i/-D/-C flags docs)
+  browser.ts      BrowserManager — Playwright context, ref map, log buffers
+
+scripts/
+  gen-skill-docs.ts   Template → SKILL.md generator (run: bun run gen:skill-docs)
+  skill-check.ts      Health dashboard (run: bun run skill:check)
+  discover-skills.ts  Shared template discovery logic
+
+test/
+  helpers/
+    session-runner.ts  Spawns claude -p for E2E tests
+    eval-store.ts      Persists eval results to ~/.gstack-dev/evals/
+    touchfiles.ts      Declares file-to-test dependencies for diff-based selection
+  skill-e2e-*.test.ts  E2E tests per skill category
+  skill-validation.test.ts  Tier 1 static validation
+```
+
+---
+
+## Common contributor questions
+
+**Q: How do I add a new browse command?**
+1. Add entry to `browse/src/commands.ts` (category + description + args).
+2. Implement handler in `browse/src/server.ts` (appropriate `handle*Command` function).
+3. Run `bun run gen:skill-docs` — the command now appears in all SKILL.md files.
+4. Run `bun test` to validate. Run `bun run build` to recompile the binary.
+
+**Q: How do I update skill prose without touching code?**
+Edit `<skill-dir>/SKILL.md.tmpl` → `bun run gen:skill-docs` → commit both files.
+
+**Q: Why does the server use HTTP and not WebSockets or MCP?**
+HTTP request/response is simpler, debuggable with `curl`, and fast enough. MCP adds
+JSON schema overhead per request and requires a persistent connection. The bottleneck
+is always Chromium, not transport.
+
+**Q: Where are cookies stored?**
+Never on disk (after decryption). Decrypted values live in the Playwright browser
+context in-process. The raw encrypted cookies come from Chromium's SQLite DB
+(copied to temp, opened read-only). Decryption uses PBKDF2 + AES-128-CBC from the
+macOS Keychain password.
+
+**Q: How does version auto-restart work?**
+`bun run build` writes `git rev-parse HEAD` to `browse/dist/.version`. The compiled
+binary embeds this SHA. On each CLI call, if the running server's `binaryVersion`
+doesn't match, the CLI kills it and spawns a new one. Stale servers are impossible.
+
+**Q: Can I run multiple gstack sessions simultaneously?**
+Yes. Each workspace gets its own `.gstack/browse.json` with a random port. Ten
+Conductor workspaces → ten independent browse daemons, no port conflicts.

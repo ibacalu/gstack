@@ -170,6 +170,7 @@ Each skill feeds into the next. `/office-hours` writes a design doc that `/plan-
 | `/freeze` | **Edit Lock** — restrict file edits to one directory. Prevents accidental changes outside scope while debugging. |
 | `/guard` | **Full Safety** — `/careful` + `/freeze` in one command. Maximum safety for prod work. |
 | `/unfreeze` | **Unlock** — remove the `/freeze` boundary. |
+| `/architecture` | **Internals Guide** — explains the gstack architecture: daemon model, ref system, logging, security, SKILL.md templates, and E2E test infrastructure. Use when contributing to or debugging gstack. |
 | `/setup-deploy` | **Deploy Configurator** — one-time setup for `/land-and-deploy`. Detects your platform, production URL, and deploy commands. |
 | `/gstack-upgrade` | **Self-Updater** — upgrade gstack to latest. Detects global vs vendored install, syncs both, shows what changed. |
 
